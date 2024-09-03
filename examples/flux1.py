@@ -14,15 +14,16 @@ import math
 from typing import Callable
 
 from tinygrad import Tensor, nn, dtypes
+from tinygrad.nn.state import safe_load, load_state_dict
 from tinygrad.helpers import fetch
 
-from extra.models.clip import Tokenizer, Closed
+from extra.models.clip import FrozenClosedClipEmbedder
 from extra.models.t5 import T5Embedder
 
 def TensorIdentity(x: Tensor) -> Tensor:
   return x
 
-##https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py
 
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
   q, k = apply_rope(q, k, pe)
@@ -36,8 +37,7 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
   assert dim % 2 == 0
   scale = Tensor.arange(0, dim, 2, dtype=dtypes.float64, device=pos.device) / dim
   omega = 1.0 / (theta**scale)
-  ##out = Tensor.einsum("...n,d->...nd", pos, omega) ##not suported in tinygrad
-  out = pos.unsqueeze(-1) * omega.unsqueeze(0)
+  out = pos.unsqueeze(-1) * omega.unsqueeze(0) # equivalent to Tensor.einsum("...n,d->...nd", pos, omega)
 
   out = Tensor.stack(Tensor.cos(out), -Tensor.sin(out), Tensor.sin(out), Tensor.cos(out), dim=-1)
   out = out.rearrange("b n d (i j) -> b n d i j", i=2, j=2)
@@ -50,19 +50,14 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tenso
   xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
   return xq_out.reshape(*xq.shape).cast(xq.dtype), xk_out.reshape(*xk.shape).cast(xk.dtype)
 
-#Conditioner
-class ClipEmbedder:
-  def __init__(self):
-    self.tokenizer = Tokenizer.ClipTokenizer()
-    self.encoder = Closed.ClipTextModel(None)
-
-  def __call__(self, text):
-    batch_encoding = Tensor([self.tokenizer.encode(text[0])])  ##TODO: allow batch size > 1
-    ret = self.encoder.text_model(batch_encoding)
-    return ret[:, batch_encoding.argmax(axis=-1)].squeeze(0)
+# Conditioner
+class ClipEmbedder(FrozenClosedClipEmbedder):
+  def __call__(self, texts):
+    tokens = Tensor.cat(*[Tensor(self.tokenizer.encode(text)) for text in texts], dim=0)
+    return self.transformer.text_model(tokens.reshape(len(texts),-1))[:, tokens.argmax(-1)]
 
 
-## https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/autoencoder.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/autoencoder.py
 @dataclass
 class AutoEncoderParams:
   resolution: int
@@ -74,9 +69,6 @@ class AutoEncoderParams:
   z_channels: int
   scale_factor: float
   shift_factor: float
-
-def swish(x: Tensor) -> Tensor:
-  return x * Tensor.sigmoid(x)
 
 class AttnBlock:
   def __init__(self, in_channels: int):
@@ -121,12 +113,10 @@ class ResnetBlock:
 
   def __call__(self, x):
     h = x
-    h = self.norm1(h)
-    h = swish(h)
+    h = self.norm1(h).swish()
     h = self.conv1(h)
 
-    h = self.norm2(h)
-    h = swish(h)
+    h = self.norm2(h).swish()
     h = self.conv2(h)
 
     if self.in_channels != self.out_channels:  x = self.nin_shortcut(x)
@@ -221,8 +211,7 @@ class Encoder:
     h = self.mid["attn_1"](h)
     h = self.mid["block_2"](h)
     # end
-    h = self.norm_out(h)
-    h = swish(h)
+    h = self.norm_out(h).swish()
     h = self.conv_out(h)
     return h
 
@@ -299,8 +288,7 @@ class Decoder:
         h = self.up[i_level]["upsample"](h)
 
     # end
-    h = self.norm_out(h)
-    h = swish(h)
+    h = self.norm_out(h).swish()
     h = self.conv_out(h)
     return h
 
@@ -353,7 +341,7 @@ class AutoEncoder:
   def __call__(self, x: Tensor) -> Tensor:
     return self.decode(self.encode(x))
 
-#https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
 class EmbedND:
   def __init__(self, dim: int, theta: int, axes_dim: list[int]):
     self.dim = dim
@@ -576,7 +564,7 @@ class LastLayer:
     x = self.linear(x)
     return x
 
-#https://github.com/black-forest-labs/flux/blob/main/src/flux/model.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/model.py
 class Model:
   @dataclass
   class FluxParams:
@@ -603,9 +591,7 @@ class Model:
       self.in_channels = params.in_channels
       self.out_channels = self.in_channels
       if params.hidden_size % params.num_heads != 0:
-        raise ValueError(
-            f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}"
-        )
+        raise ValueError(f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}")
       pe_dim = params.hidden_size // params.num_heads
       if sum(params.axes_dim) != pe_dim:
         raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
@@ -615,11 +601,7 @@ class Model:
       self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
       self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
       self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
-      self.guidance_in = (
-          MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
-          if params.guidance_embed
-          else TensorIdentity
-      )
+      self.guidance_in = (MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else TensorIdentity)
       self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
       self.double_blocks = [
@@ -676,123 +658,85 @@ class Model:
       img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
       return img
 
-#https://github.com/black-forest-labs/flux/blob/main/src/flux/util.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/util.py
 class Util:
-  @dataclass
-  class ModelSpec:
-    params: Model.FluxParams
-    ae_params: AutoEncoderParams
-    repo_id: str | None
-    repo_flow: str | None
-    repo_ae: str | None
-    repo_T5: dict
-    repo_clip: list
-
   configs = {
-      "base_url": "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/",
-      "flux-dev": ModelSpec(
-          repo_id="black-forest-labs/FLUX.1-dev",
-          repo_flow="flux1-dev.safetensors",
-          repo_ae="ae.safetensors",
-          repo_T5={"tokenizer": "tokenizer_2/spiece.model",
-                   "weights": ["text_encoder_2/model-00001-of-00002.safetensors", "text_encoder_2/model-00002-of-00002.safetensors"]},
-          repo_clip="text_encoder/model.safetensors",
-          params=Model.FluxParams(
-              in_channels=64,
-              vec_in_dim=768,
-              context_in_dim=4096,
-              hidden_size=3072,
-              mlp_ratio=4.0,
-              num_heads=24,
-              depth=19,
-              depth_single_blocks=38,
-              axes_dim=[16, 56, 56],
-              theta=10_000,
-              qkv_bias=True,
-              guidance_embed=True,
-          ),
-          ae_params=AutoEncoderParams(
-              resolution=256,
-              in_channels=3,
-              ch=128,
-              out_ch=3,
-              ch_mult=[1, 2, 4, 4],
-              num_res_blocks=2,
-              z_channels=16,
-              scale_factor=0.3611,
-              shift_factor=0.1159,
-          ),
-      ),
-      "flux-schnell": ModelSpec(
-          repo_id="black-forest-labs/FLUX.1-schnell",
-          repo_flow="flux1-schnell.safetensors",
-          repo_ae="ae.safetensors",
-          repo_T5={"tokenizer": "tokenizer_2/spiece.model",
-                   "weights": ["text_encoder_2/model-00001-of-00002.safetensors", "text_encoder_2/model-00002-of-00002.safetensors"]},
-          repo_clip="text_encoder/model.safetensors",
-          params=Model.FluxParams(
-              in_channels=64,
-              vec_in_dim=768,
-              context_in_dim=4096,
-              hidden_size=3072,
-              mlp_ratio=4.0,
-              num_heads=24,
-              depth=19,
-              depth_single_blocks=38,
-              axes_dim=[16, 56, 56],
-              theta=10_000,
-              qkv_bias=True,
-              guidance_embed=False,
-          ),
-          ae_params=AutoEncoderParams(
-              resolution=256,
-              in_channels=3,
-              ch=128,
-              out_ch=3,
-              ch_mult=[1, 2, 4, 4],
-              num_res_blocks=2,
-              z_channels=16,
-              scale_factor=0.3611,
-              shift_factor=0.1159,
-          ),
-      ),
-  }
+    "flux-dev": Model.FluxParams(
+      in_channels=64,
+      vec_in_dim=768,
+      context_in_dim=4096,
+      hidden_size=3072,
+      mlp_ratio=4.0,
+      num_heads=24,
+      depth=19,
+      depth_single_blocks=38,
+      axes_dim=[16, 56, 56],
+      theta=10_000,
+      qkv_bias=True,
+      guidance_embed=True),
+
+    "flux-schnell": Model.FluxParams(
+      in_channels=64,
+      vec_in_dim=768,
+      context_in_dim=4096,
+      hidden_size=3072,
+      mlp_ratio=4.0,
+      num_heads=24,
+      depth=19,
+      depth_single_blocks=38,
+      axes_dim=[16, 56, 56],
+      theta=10_000,
+      qkv_bias=True,
+      guidance_embed=False),
+
+    "ae": AutoEncoderParams(
+      resolution=256,
+      in_channels=3,
+      ch=128,
+      out_ch=3,
+      ch_mult=[1, 2, 4, 4],
+      num_res_blocks=2,
+      z_channels=16,
+      scale_factor=0.3611,
+      shift_factor=0.1159)}
+  
+
 
   def load_flow_model(name: str):
     # Loading Flux
     print("Init model")
-
-    model = Model.Flux(Util.configs[name].params)
-    state_dict = nn.state.safe_load(fetch(Util.configs["base_url"] + Util.configs[name].repo_flow))
-    nn.state.load_state_dict(model, state_dict)
-
+    model = Model.Flux(Util.configs[name])
+    url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors" if name == "flux-schnell"
+           else "https://huggingface.co/camenduru/FLUX.1-dev/resolve/main/flux1-dev.sft")
+    
+    load_state_dict(model, safe_load(fetch(url)))
     return model
 
-  def load_t5(name: str, max_length: int = 512):
+  def load_T5(name: str, max_length: int = 512):
     # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
-    t5 = T5Embedder(max_length, fetch(Util.configs["base_url"] + Util.configs[name].repo_T5["tokenizer"]))
-    state_dict_pt_1, state_dict_pt_2 = [nn.state.safe_load(fetch(Util.configs["base_url"] + shard)) for shard in Util.configs[name].repo_T5["weights"]]
-    state_dict = state_dict_pt_1 | state_dict_pt_2
-    nn.state.load_state_dict(t5.encoder, state_dict, strict=False)
-
-    return t5
+    print("Init T5")
+    T5 = T5Embedder(max_length, fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/tokenizer_2/spiece.model"))
+    state_dict_pt_1 = safe_load("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00001-of-00002.safetensors")
+    state_dict_pt_2 = safe_load("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00002-of-00002.safetensors")
+    load_state_dict(T5.encoder, state_dict_pt_1 | state_dict_pt_2, strict=False)
+    return T5
 
   def load_clip(name: str):
+    print("Init Clip")
     clip = ClipEmbedder()
-    state_dict = nn.state.safe_load(fetch(Util.configs["base_url"] + Util.configs[name].repo_clip))
-    nn.state.load_state_dict(clip.encoder, state_dict)
-
+    load_state_dict(clip.encoder, safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder/model.safetensors")))
     return clip
 
   def load_ae(name: str) -> AutoEncoder:
     # Loading the autoencoder
     print("Init AE")
-    ae = AutoEncoder(Util.configs[name].ae_params)
-    state_dict = nn.state.safe_load(fetch(Util.configs["base_url"] + Util.configs[name].repo_ae))
-    nn.state.load_state_dict(ae, state_dict)
+    ae = AutoEncoder(Util.configs["ae"])
+    url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/blob/main/ae.safetensors" if name == "flux-schnell"
+        else "https://huggingface.co/camenduru/FLUX.1-dev/resolve/main/ae.sft")
+    load_state_dict(ae, safe_load(fetch(url)))
     return ae
 
-#https://github.com/black-forest-labs/flux/blob/main/src/flux/sampling.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/sampling.py
 class Sampling:
   def get_noise(
       num_samples: int,
@@ -907,7 +851,7 @@ class Sampling:
         pw=2,
     )
 
-#https://github.com/black-forest-labs/flux/blob/main/src/flux/cli.py
+# https://github.com/black-forest-labs/flux/blob/main/src/flux/cli.py
 @dataclass
 class SamplingOptions:
   prompt: str
@@ -975,11 +919,11 @@ if __name__ == "__main__":
         seed=opts.seed,
     )
 
-    #load text embedders
+    # load text embedders
     t5 = Util.load_t5(args.name, max_length=256 if args.name == "flux-schnell" else 512)
     clip = Util.load_clip(args.name)
 
-    #embed text to get inputs for model
+    # embed text to get inputs for model
     inp = Sampling.prepare(t5, clip, x, prompt=opts.prompt)
     for k, v in inp.items():  v.realize()
     timesteps = Sampling.get_schedule(opts.num_steps, inp["img"].shape[1], shift=(args.name != "flux-schnell"))
@@ -987,16 +931,16 @@ if __name__ == "__main__":
     # done with text embedders
     del t5, clip
 
-    #load model
+    # load model
     model = Util.load_flow_model(args.name)
 
     # denoise initial noise
     x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance).realize()
 
-    #done with model
+    # done with model
     del model
 
-    #load autoencoder
+    # load autoencoder
     ae = Util.load_ae(args.name)
 
     # decode latents to pixel space
@@ -1014,4 +958,3 @@ if __name__ == "__main__":
   img = Image.fromarray((127.5 * (x + 1.0)).cast("uint8").numpy())
 
   img.save(fn, quality=95, subsampling=0)
-  idx += 1
