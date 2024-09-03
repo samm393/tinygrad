@@ -696,7 +696,6 @@ class Util:
       z_channels=16,
       scale_factor=0.3611,
       shift_factor=0.1159)}
-  
 
 
   def load_flow_model(name: str):
@@ -705,7 +704,7 @@ class Util:
     model = Model.Flux(Util.configs[name])
     url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors" if name == "flux-schnell"
            else "https://huggingface.co/camenduru/FLUX.1-dev/resolve/main/flux1-dev.sft")
-    
+
     load_state_dict(model, safe_load(fetch(url)))
     return model
 
