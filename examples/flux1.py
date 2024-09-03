@@ -13,9 +13,9 @@ import argparse
 import math
 from typing import Callable
 
-from tinygrad import Tensor, nn, dtypes
+from tinygrad import Tensor, nn, dtypes, TinyJit
 from tinygrad.nn.state import safe_load, load_state_dict
-from tinygrad.helpers import fetch
+from tinygrad.helpers import fetch, tqdm
 
 from extra.models.clip import FrozenClosedClipEmbedder
 from extra.models.t5 import T5Embedder
@@ -88,9 +88,9 @@ class AttnBlock:
     v = self.v(h_)
 
     b, c, h, w = q.shape
-    q = q.rearrange("b c h w -> b 1 (h w) c").contiguous()
-    k = k.rearrange("b c h w -> b 1 (h w) c").contiguous()
-    v = v.rearrange("b c h w -> b 1 (h w) c").contiguous()
+    q = q.rearrange("b c h w -> b 1 (h w) c")
+    k = k.rearrange("b c h w -> b 1 (h w) c")
+    v = v.rearrange("b c h w -> b 1 (h w) c")
     h_ = Tensor.scaled_dot_product_attention(q, k, v)
 
     return h_.rearrange("b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
@@ -374,7 +374,7 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
   args = t[:, None].float() * freqs[None]
   embedding = Tensor.cat(Tensor.cos(args), Tensor.sin(args), dim=-1)
   if dim % 2:  embedding = Tensor.cat(*[embedding, Tensor.zeros_like(embedding[:, :1])], dim=-1)
-  if Tensor.is_floating_point(t):  embedding = embedding.to(t.device)
+  if Tensor.is_floating_point(t):  embedding = embedding.cast(t.dtype)
   return embedding
 
 class MLPEmbedder:
@@ -633,7 +633,6 @@ class Model:
     ) -> Tensor:
       if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
-
       # running on sequences img
       img = self.img_in(img)
       vec = self.time_in(timestep_embedding(timesteps, 256))
@@ -643,16 +642,14 @@ class Model:
         vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
       vec = vec + self.vector_in(y)
       txt = self.txt_in(txt)
-
       ids = Tensor.cat(txt_ids, img_ids, dim=1)
       pe = self.pe_embedder(ids)
       for block in self.double_blocks:
         img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-        img, txt = img.realize(), txt.realize()
 
       img = Tensor.cat(txt, img, dim=1)
       for block in self.single_blocks:
-        img = block(img, vec=vec, pe=pe).realize()
+        img = block(img, vec=vec, pe=pe)
       img = img[:, txt.shape[1] :, ...]
 
       img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
@@ -716,22 +713,22 @@ class Util:
     # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
     print("Init T5")
     T5 = T5Embedder(max_length, fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/tokenizer_2/spiece.model"))
-    state_dict_pt_1 = safe_load("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00001-of-00002.safetensors")
-    state_dict_pt_2 = safe_load("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00002-of-00002.safetensors")
-    load_state_dict(T5.encoder, state_dict_pt_1 | state_dict_pt_2, strict=False)
+    pt_1 = fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00001-of-00002.safetensors")
+    pt_2 = fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder_2/model-00002-of-00002.safetensors")
+    load_state_dict(T5.encoder, safe_load(pt_1) | safe_load(pt_2), strict=False)
     return T5
 
   def load_clip(name: str):
     print("Init Clip")
     clip = ClipEmbedder()
-    load_state_dict(clip.encoder, safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder/model.safetensors")))
+    load_state_dict(clip.transformer, safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder/model.safetensors")))
     return clip
 
   def load_ae(name: str) -> AutoEncoder:
     # Loading the autoencoder
     print("Init AE")
     ae = AutoEncoder(Util.configs["ae"])
-    url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/blob/main/ae.safetensors" if name == "flux-schnell"
+    url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors" if name == "flux-schnell"
         else "https://huggingface.co/camenduru/FLUX.1-dev/resolve/main/ae.sft")
     load_state_dict(ae, safe_load(fetch(url)))
     return ae
@@ -749,7 +746,7 @@ class Sampling:
 
     return Tensor.randn(num_samples, 16, 2 * math.ceil(height / 16), 2 * math.ceil(width / 16), dtype=dtype)
 
-  def prepare(t5, clip, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]:
+  def prepare(T5, clip, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]:
     bs, _, h, w = img.shape
     if bs == 1 and not isinstance(prompt, str):
       bs = len(prompt)
@@ -766,7 +763,7 @@ class Sampling:
 
     if isinstance(prompt, str):
       prompt = [prompt]
-    txt = t5(prompt)
+    txt = T5(prompt)
     if txt.shape[0] == 1 and bs > 1:
       txt = txt.expand((bs, *txt.shape[1:]))
     txt_ids = Tensor.zeros(bs, txt.shape[1], 3)
@@ -826,19 +823,9 @@ class Sampling:
   ):
     # this is ignored for schnell
     guidance_vec = Tensor.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-      t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
-      pred = model(
-          img=img,
-          img_ids=img_ids,
-          txt=txt,
-          txt_ids=txt_ids,
-          y=vec,
-          timesteps=t_vec,
-          guidance=guidance_vec,
-      )
+    for t_curr, t_prev in tqdm(list(zip(timesteps[:-1], timesteps[1:])), f"Denoising"):
+      img = step(model, img, t_curr, t_prev, img_ids, txt, txt_ids, vec, guidance_vec)
 
-      img = img + (t_prev - t_curr) * pred
 
     return img
 
@@ -850,6 +837,22 @@ class Sampling:
         ph=2,
         pw=2,
     )
+
+# @TinyJit
+def step(model, img, t_curr, t_prev, img_ids, txt, txt_ids, vec, guidance_vec):
+  t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+  pred = model(
+      img=img,
+      img_ids=img_ids,
+      txt=txt,
+      txt_ids=txt_ids,
+      y=vec,
+      timesteps=t_vec,
+      guidance=guidance_vec,
+  )
+
+  img = img + (t_prev - t_curr) * pred
+  return img.realize()
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/cli.py
 @dataclass
@@ -920,22 +923,22 @@ if __name__ == "__main__":
     )
 
     # load text embedders
-    t5 = Util.load_t5(args.name, max_length=256 if args.name == "flux-schnell" else 512)
+    T5 = Util.load_T5(args.name, max_length=256 if args.name == "flux-schnell" else 512)
     clip = Util.load_clip(args.name)
 
     # embed text to get inputs for model
-    inp = Sampling.prepare(t5, clip, x, prompt=opts.prompt)
+    inp = Sampling.prepare(T5, clip, x, prompt=opts.prompt)
     for k, v in inp.items():  v.realize()
     timesteps = Sampling.get_schedule(opts.num_steps, inp["img"].shape[1], shift=(args.name != "flux-schnell"))
 
     # done with text embedders
-    del t5, clip
+    del T5, clip
 
     # load model
     model = Util.load_flow_model(args.name)
 
     # denoise initial noise
-    x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance).realize()
+    x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
 
     # done with model
     del model
