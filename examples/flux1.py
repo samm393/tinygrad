@@ -144,77 +144,6 @@ class Upsample:
     x = self.conv(x)
     return x
 
-class Encoder:
-  def __init__(
-      self,
-      resolution: int,
-      in_channels: int,
-      ch: int,
-      ch_mult: list[int],
-      num_res_blocks: int,
-      z_channels: int,
-  ):
-    self.ch = ch
-    self.num_resolutions = len(ch_mult)
-    self.num_res_blocks = num_res_blocks
-    self.resolution = resolution
-    self.in_channels = in_channels
-    # downsampling
-    self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
-
-    curr_res = resolution
-    in_ch_mult = (1,) + tuple(ch_mult)
-    self.in_ch_mult = in_ch_mult
-    self.down = []
-    block_in = self.ch
-    for i_level in range(self.num_resolutions):
-      block = []
-      attn = []
-      block_in = ch * in_ch_mult[i_level]
-      block_out = ch * ch_mult[i_level]
-      for _ in range(self.num_res_blocks):
-        block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
-        block_in = block_out
-      down = {}
-      down["block"] = block
-      down["attn"] = attn
-      if i_level != self.num_resolutions - 1:
-        down["downsample"] = Downsample(block_in)
-        curr_res = curr_res // 2
-      self.down.append(down)
-
-    # middle
-    self.mid = {}
-    self.mid["block_1"] = ResnetBlock(in_channels=block_in, out_channels=block_in)
-    self.mid["attn_1"] = AttnBlock(block_in)
-    self.mid["block_2"] = ResnetBlock(in_channels=block_in, out_channels=block_in)
-
-    # end
-    self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-    self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
-
-  def __call__(self, x: Tensor) -> Tensor:
-    # downsampling
-    hs = [self.conv_in(x)]
-    for i_level in range(self.num_resolutions):
-      for i_block in range(self.num_res_blocks):
-        h = self.down[i_level]["block"][i_block](hs[-1])
-        if len(self.down[i_level]["attn"]) > 0:
-          h = self.down[i_level]["attn"][i_block](h)
-        hs.append(h)
-      if i_level != self.num_resolutions - 1:
-        hs.append(self.down[i_level]["downsample"](hs[-1]))
-
-    # middle
-    h = hs[-1]
-    h = self.mid["block_1"](h)
-    h = self.mid["attn_1"](h)
-    h = self.mid["block_2"](h)
-    # end
-    h = self.norm_out(h).swish()
-    h = self.conv_out(h)
-    return h
-
 
 class Decoder:
   def __init__(
@@ -307,14 +236,6 @@ class DiagonalGaussian:
 
 class AutoEncoder:
   def __init__(self, params: AutoEncoderParams):
-    self.encoder = Encoder(
-        resolution=params.resolution,
-        in_channels=params.in_channels,
-        ch=params.ch,
-        ch_mult=params.ch_mult,
-        num_res_blocks=params.num_res_blocks,
-        z_channels=params.z_channels,
-    )
     self.decoder = Decoder(
         resolution=params.resolution,
         in_channels=params.in_channels,
@@ -329,17 +250,9 @@ class AutoEncoder:
     self.scale_factor = params.scale_factor
     self.shift_factor = params.shift_factor
 
-  def encode(self, x: Tensor) -> Tensor:
-    z = self.reg(self.encoder(x))
-    z = self.scale_factor * (z - self.shift_factor)
-    return z
-
   def decode(self, z: Tensor) -> Tensor:
     z = z / self.scale_factor + self.shift_factor
     return self.decoder(z)
-
-  def __call__(self, x: Tensor) -> Tensor:
-    return self.decode(self.encode(x))
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
 class EmbedND:
@@ -823,7 +736,7 @@ class Sampling:
     # this is ignored for schnell
     guidance_vec = Tensor.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
     for t_curr, t_prev in tqdm(list(zip(timesteps[:-1], timesteps[1:])), f"Denoising"):
-      img = step(model, img, t_curr, t_prev, img_ids, txt, txt_ids, vec, guidance_vec)
+      img = step(model, img, Tensor(t_curr), t_prev, img_ids, txt, txt_ids, vec, guidance_vec)
 
 
     return img
@@ -838,8 +751,9 @@ class Sampling:
     )
 
 # @TinyJit
-def step(model, img, t_curr, t_prev, img_ids, txt, txt_ids, vec, guidance_vec):
-  t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+def step(model, img, t_curr: Tensor, t_prev, img_ids, txt, txt_ids, vec, guidance_vec):
+  #t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+  t_vec = t_curr.expand((img.shape[0],)).to(img.device).cast(img.dtype).realize()
   pred = model(
       img=img,
       img_ids=img_ids,
@@ -940,7 +854,7 @@ if __name__ == "__main__":
     x = Sampling.denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
 
     # done with model
-    del model
+    del model, step
 
     # load autoencoder
     ae = Util.load_ae(args.name)
