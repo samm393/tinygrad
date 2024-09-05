@@ -123,18 +123,6 @@ class ResnetBlock:
 
     return x + h
 
-class Downsample:
-  def __init__(self, in_channels: int):
-    # no asymmetric padding in torch conv, must do it ourselves
-    self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
-
-  def __call__(self, x: Tensor):
-    pad = (0, 1, 0, 1)
-    x = nn.functional.pad(x, pad, mode="constant", value=0)
-    x = self.conv(x)
-    return x
-
-
 class Upsample:
   def __init__(self, in_channels: int):
     self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
@@ -143,7 +131,6 @@ class Upsample:
     x = Tensor.interpolate(x, size=(x.shape[-2] * 2, x.shape[-1] * 2), mode="nearest")
     x = self.conv(x)
     return x
-
 
 class Decoder:
   def __init__(
@@ -221,19 +208,6 @@ class Decoder:
     h = self.conv_out(h)
     return h
 
-class DiagonalGaussian:
-  def __init__(self, sample: bool = True, chunk_dim: int = 1):
-    self.sample = sample
-    self.chunk_dim = chunk_dim
-
-  def __call__(self, z: Tensor) -> Tensor:
-    mean, logvar = Tensor.chunk(z, 2, dim=self.chunk_dim)
-    if self.sample:
-      std = Tensor.exp(0.5 * logvar)
-      return mean + std * Tensor.randn_like(mean)
-    else:
-      return mean
-
 class AutoEncoder:
   def __init__(self, params: AutoEncoderParams):
     self.decoder = Decoder(
@@ -245,7 +219,6 @@ class AutoEncoder:
         num_res_blocks=params.num_res_blocks,
         z_channels=params.z_channels,
     )
-    self.reg = DiagonalGaussian()
 
     self.scale_factor = params.scale_factor
     self.shift_factor = params.shift_factor
@@ -253,6 +226,7 @@ class AutoEncoder:
   def decode(self, z: Tensor) -> Tensor:
     z = z / self.scale_factor + self.shift_factor
     return self.decoder(z)
+
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
 class EmbedND:
@@ -686,9 +660,9 @@ class Sampling:
 
     return {
         "img": img,
-        "img_ids": img_ids.to(img.device),
+        "img_ids": img_ids.to(img.device).cast(img.dtype),
         "txt": txt.to(img.device),
-        "txt_ids": txt_ids.to(img.device),
+        "txt_ids": txt_ids.to(img.device).cast(img.dtype),
         "vec": vec.to(img.device),
     }
 
@@ -736,8 +710,9 @@ class Sampling:
     # this is ignored for schnell
     guidance_vec = Tensor.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
     for t_curr, t_prev in tqdm(list(zip(timesteps[:-1], timesteps[1:])), f"Denoising"):
-      img = step(model, img, Tensor(t_curr), t_prev, img_ids, txt, txt_ids, vec, guidance_vec)
-
+      t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+      pred = step(model, img, t_vec.contiguous(), img_ids, txt, txt_ids.contiguous(), vec, guidance_vec.contiguous())
+      img = img + (t_prev - t_curr) * pred
 
     return img
 
@@ -750,10 +725,8 @@ class Sampling:
         pw=2,
     )
 
-# @TinyJit
-def step(model, img, t_curr: Tensor, t_prev, img_ids, txt, txt_ids, vec, guidance_vec):
-  #t_vec = Tensor.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
-  t_vec = t_curr.expand((img.shape[0],)).to(img.device).cast(img.dtype).realize()
+@TinyJit
+def step(model, img, t_vec, img_ids, txt, txt_ids, vec, guidance_vec):
   pred = model(
       img=img,
       img_ids=img_ids,
@@ -764,8 +737,8 @@ def step(model, img, t_curr: Tensor, t_prev, img_ids, txt, txt_ids, vec, guidanc
       guidance=guidance_vec,
   )
 
-  img = img + (t_prev - t_curr) * pred
-  return img.realize()
+  
+  return pred.realize()
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/cli.py
 @dataclass
