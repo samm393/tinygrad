@@ -35,7 +35,7 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
   assert dim % 2 == 0
-  scale = Tensor.arange(0, dim, 2, dtype=dtypes.float64, device=pos.device) / dim
+  scale = Tensor.arange(0, dim, 2, dtype=dtypes.float32 if pos.device.startswith("METAL") else dtypes.float64, device=pos.device) / dim
   omega = 1.0 / (theta**scale)
   out = pos.unsqueeze(-1) * omega.unsqueeze(0) # equivalent to Tensor.einsum("...n,d->...nd", pos, omega)
 
@@ -659,9 +659,9 @@ def prepare(T5, clip, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]
 
   return {
       "img": img,
-      "img_ids": img_ids.to(img.device).cast(img.dtype),
+      "img_ids": img_ids.to(img.device),
       "txt": txt.to(img.device),
-      "txt_ids": txt_ids.to(img.device).cast(img.dtype),
+      "txt_ids": txt_ids.to(img.device),
       "vec": vec.to(img.device),
   }
 

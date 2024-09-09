@@ -19,6 +19,8 @@
 import copy
 import math
 
+from typing import List, Union
+
 from tinygrad import nn, Tensor, dtypes
 
 from sentencepiece import SentencePieceProcessor
@@ -49,26 +51,14 @@ class T5Config:
     self.relative_attention_max_distance = relative_attention_max_distance
     self.vocab_size = vocab_size
 
-
-class NewGELUActivation:
-  """
-  Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT). Also see
-  the Gaussian Error Linear Units paper: https://arxiv.org/abs/1606.08415
-  """
-
-  def __call__(self, x: Tensor) -> Tensor:
-    return 0.5 * x * (1.0 + Tensor.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * Tensor.pow(x, 3.0))))
-
 class T5Tokenizer:
   def __init__(self, spiece_path):
     self.spp = SentencePieceProcessor(str(spiece_path))
 
-  def __call__(self, text, max_length, *args, **kwargs):
-    if isinstance(text, str): text = [text]
+  def encode(self, text, max_length):
     encoded = self.spp.Encode(text)
-    ret = Tensor.zeros((len(encoded), max_length), dtype=dtypes.int).contiguous()
-    for i, row in enumerate(encoded): ret[i, : len(row) + 1] = Tensor(row + [1])
-    return {"input_ids": ret}
+    if len(encoded) > max_length - 1: encoded = encoded[:max_length - 1]
+    return encoded + [1] + [0]*(max_length - len(encoded) - 1)
 
 class T5LayerNorm:
   def __init__(self, hidden_size, eps=1e-6):
@@ -99,10 +89,9 @@ class T5DenseGatedActDense:
     self.wi_0 = nn.Linear(config.d_model, config.d_ff, bias=False)
     self.wi_1 = nn.Linear(config.d_model, config.d_ff, bias=False)
     self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
-    self.act = NewGELUActivation()
 
   def __call__(self, hidden_states):
-    hidden_gelu = self.act(self.wi_0(hidden_states))
+    hidden_gelu = self.wi_0(hidden_states).gelu()
     hidden_linear = self.wi_1(hidden_states)
     hidden_states = hidden_gelu * hidden_linear
     hidden_states = self.wo(hidden_states)
@@ -332,10 +321,7 @@ class T5Stack:
   def set_input_embeddings(self, new_embeddings):
     self.embed_tokens = new_embeddings
 
-  def __call__(
-      self,
-      input_ids=None,
-  ):
+  def __call__(self, input_ids):
     input_shape = input_ids.size()
     input_ids = input_ids.view(-1, input_shape[-1])
 
@@ -359,10 +345,8 @@ class T5Stack:
       # hidden-states, key-value-states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights) #noqa:E501
       hidden_states, position_bias = layer_outputs[0], layer_outputs[1]
 
-    hidden_states = self.final_layer_norm(hidden_states)
-    hidden_states = hidden_states
+    return self.final_layer_norm(hidden_states)
 
-    return {"last_hidden_states": hidden_states}
 
 
 class T5EncoderModel:
@@ -373,30 +357,8 @@ class T5EncoderModel:
     encoder_config = copy.deepcopy(config)
     self.encoder = T5Stack(encoder_config, self.shared)
 
-  ### TODO: typing
-  def __call__(
-      self,
-      input_ids=None,
-      attention_mask=None,
-  ):
-    r"""
-    Returns:
-
-    Example:
-
-    ```python
-    >>> from transformers import AutoTokenizer, T5EncoderModel
-
-    >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
-    >>> model = T5EncoderModel.from_pretrained("google-t5/t5-small")
-    >>> input_ids = tokenizer(
-    ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
-    ... ).input_ids  # Batch size 1
-    >>> outputs = model(input_ids=input_ids)
-    >>> last_hidden_states = outputs.last_hidden_state
-    ```"""
-
-    return self.encoder(input_ids=input_ids)
+  def __call__(self, input_ids):
+    return self.encoder(input_ids)
 
 class T5Embedder:
   def __init__(self, max_length, spiece_path):
@@ -418,6 +380,7 @@ class T5Embedder:
     )
     self.encoder = T5EncoderModel(config)
 
-  def __call__(self, text: str):
-    toks = self.tokenizer(text, self.max_length)
-    return self.encoder(toks["input_ids"])["last_hidden_states"]
+  def __call__(self, texts: Union[str, List[str]]):
+    if isinstance(texts, str): texts = [texts]
+    toks = Tensor.cat(*[Tensor(self.tokenizer.encode(text, self.max_length)) for text in texts], dim=0)
+    return self.encoder(toks)
