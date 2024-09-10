@@ -9,13 +9,14 @@ from dataclasses import dataclass
 from glob import iglob
 from PIL import Image
 import argparse
+import numpy as np
 
 import math
 from typing import Callable
 
 from tinygrad import Tensor, nn, dtypes, TinyJit
 from tinygrad.nn.state import safe_load, load_state_dict
-from tinygrad.helpers import fetch, tqdm
+from tinygrad.helpers import fetch, tqdm, colored
 
 from extra.models.clip import FrozenClosedClipEmbedder
 from extra.models.t5 import T5Embedder
@@ -35,7 +36,7 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
   assert dim % 2 == 0
-  scale = Tensor.arange(0, dim, 2, dtype=dtypes.float32 if pos.device.startswith("METAL") else dtypes.float64, device=pos.device) / dim
+  scale = Tensor.arange(0, dim, 2, dtype=dtypes.float32, device=pos.device) / dim
   omega = 1.0 / (theta**scale)
   out = pos.unsqueeze(-1) * omega.unsqueeze(0) # equivalent to Tensor.einsum("...n,d->...nd", pos, omega)
 
@@ -60,15 +61,15 @@ class ClipEmbedder(FrozenClosedClipEmbedder):
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/autoencoder.py
 @dataclass
 class AutoEncoderParams:
-  resolution: int
-  in_channels: int
-  ch: int
-  out_ch: int
-  ch_mult: list[int]
-  num_res_blocks: int
-  z_channels: int
-  scale_factor: float
-  shift_factor: float
+  resolution: int = 256
+  in_channels: int = 3
+  ch: int = 128
+  out_ch: int = 3
+  ch_mult: tuple[int] = (1, 2, 4, 4)
+  num_res_blocks: int = 2
+  z_channels: int = 16
+  scale_factor: float = 0.3611
+  shift_factor: float = 0.1159
 
 class AttnBlock:
   def __init__(self, in_channels: int):
@@ -230,7 +231,7 @@ class AutoEncoder:
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
 class EmbedND:
-  def __init__(self, dim: int, theta: int, axes_dim: list[int]):
+  def __init__(self, dim: int, theta: int, axes_dim: tuple[int]):
     self.dim = dim
     self.theta = theta
     self.axes_dim = axes_dim
@@ -455,18 +456,18 @@ class LastLayer:
 class Model:
   @dataclass
   class FluxParams:
-    in_channels: int
-    vec_in_dim: int
-    context_in_dim: int
-    hidden_size: int
-    mlp_ratio: float
-    num_heads: int
-    depth: int
-    depth_single_blocks: int
-    axes_dim: list[int]
-    theta: int
-    qkv_bias: bool
     guidance_embed: bool
+    in_channels: int = 64
+    vec_in_dim: int = 768
+    context_in_dim: int = 4096
+    hidden_size: int = 3072
+    mlp_ratio: float = 4.0
+    num_heads: int = 24
+    depth: int = 19
+    depth_single_blocks: int = 38
+    axes_dim: tuple[int] = (16, 56, 56)
+    theta: int = 10_000
+    qkv_bias: bool = True
 
   class Flux:
     """
@@ -545,45 +546,9 @@ class Model:
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/util.py
 class Util:
   configs = {
-    "flux-dev": Model.FluxParams(
-      in_channels=64,
-      vec_in_dim=768,
-      context_in_dim=4096,
-      hidden_size=3072,
-      mlp_ratio=4.0,
-      num_heads=24,
-      depth=19,
-      depth_single_blocks=38,
-      axes_dim=[16, 56, 56],
-      theta=10_000,
-      qkv_bias=True,
-      guidance_embed=True),
-
-    "flux-schnell": Model.FluxParams(
-      in_channels=64,
-      vec_in_dim=768,
-      context_in_dim=4096,
-      hidden_size=3072,
-      mlp_ratio=4.0,
-      num_heads=24,
-      depth=19,
-      depth_single_blocks=38,
-      axes_dim=[16, 56, 56],
-      theta=10_000,
-      qkv_bias=True,
-      guidance_embed=False),
-
-    "ae": AutoEncoderParams(
-      resolution=256,
-      in_channels=3,
-      ch=128,
-      out_ch=3,
-      ch_mult=[1, 2, 4, 4],
-      num_res_blocks=2,
-      z_channels=16,
-      scale_factor=0.3611,
-      shift_factor=0.1159)}
-
+    "flux-dev": Model.FluxParams(guidance_embed=True),
+    "flux-schnell": Model.FluxParams(guidance_embed=False),
+    "ae": AutoEncoderParams()}
 
   def load_flow_model(name: str):
     # Loading Flux
@@ -614,8 +579,7 @@ class Util:
     # Loading the autoencoder
     print("Init AE")
     ae = AutoEncoder(Util.configs["ae"])
-    url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors" if name == "flux-schnell"
-        else "https://huggingface.co/camenduru/FLUX.1-dev/resolve/main/ae.sft")
+    url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors")
     load_state_dict(ae, safe_load(fetch(url)))
     return ae
 
@@ -740,7 +704,7 @@ class SamplingOptions:
   seed: int | None
 
 if __name__ == "__main__":
-  default_prompt = "a horse sized cat eating a bagel"
+  default_prompt = "bananas by a coke can"
   parser = argparse.ArgumentParser(description="Run Flux.1", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
   parser.add_argument("--name",       type=str,   default="flux-schnell", help="Name of the model to load")
@@ -765,12 +729,12 @@ if __name__ == "__main__":
   height = 16 * (args.height // 16)
   width = 16 * (args.width // 16)
 
-  output_name = os.path.join(args.output_dir, "img_{idx}.jpg")
+  output_name = os.path.join(args.output_dir, "img_{idx}.png")
   if not os.path.exists(args.output_dir):
     os.makedirs(args.output_dir)
     idx = 0
   else:
-    fns = [fn for fn in iglob(output_name.format(idx="*")) if re.search(r"img_[0-9]+\.jpg$", fn)]
+    fns = [fn for fn in iglob(output_name.format(idx="*")) if re.search(r"img_[0-9]+\.png$", fn)]
     idx = max(int(fn.split("_")[-1].split(".")[0]) for fn in fns) + 1 if len(fns) > 0 else 0
 
   with Tensor.test():
@@ -832,7 +796,15 @@ if __name__ == "__main__":
   # bring into PIL format and save
   x = x.clamp(-1, 1)
   x = x[0].rearrange("c h w -> h w c")
+  x = (127.5 * (x + 1.0)).cast("uint8")
 
-  img = Image.fromarray((127.5 * (x + 1.0)).cast("uint8").numpy())
+  img = Image.fromarray(x.numpy())
 
-  img.save(fn, quality=95, subsampling=0)
+  img.save(fn)
+
+  # validation!
+  if args.prompt == default_prompt and args.name=="flux-dev" and args.seed == 0 and args.width == args.height == 512:
+    ref_image = Tensor(np.array(Image.open("examples/flux1_seed0.png")))
+    distance = (((x.cast(dtypes.float) - ref_image.cast(dtypes.float)) / ref_image.max())**2).mean().item()
+    assert distance < 4e-3, colored(f"validation failed with {distance=}", "red")
+    print(colored(f"output validated with {distance=}", "green"))

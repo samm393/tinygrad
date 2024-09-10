@@ -19,37 +19,26 @@
 import copy
 import math
 
+from dataclasses import dataclass
 from typing import List, Union
 
 from tinygrad import nn, Tensor, dtypes
 
 from sentencepiece import SentencePieceProcessor
 
-
+# default config is t5-xxl
+@dataclass
 class T5Config:
-  def __init__(
-      self,
-      d_ff=1024,
-      d_kv=64,
-      d_model=512,
-      layer_norm_epsilon=1e-6,
-      num_decoder_layers=8,
-      num_heads=6,
-      num_layers=8,
-      relative_attention_num_buckets=32,
-      relative_attention_max_distance=128,
-      vocab_size=32128,
-  ):
-    self.d_ff = d_ff
-    self.d_kv = d_kv
-    self.d_model = d_model
-    self.layer_norm_epsilon = layer_norm_epsilon
-    self.num_decoder_layers = num_decoder_layers
-    self.num_heads = num_heads
-    self.num_layers = num_layers
-    self.relative_attention_num_buckets = relative_attention_num_buckets
-    self.relative_attention_max_distance = relative_attention_max_distance
-    self.vocab_size = vocab_size
+  d_ff: int = 10240
+  d_kv: int = 64
+  d_model: int = 4096
+  layer_norm_epsilon: float = 1e-6
+  num_decoder_layers: int = 24
+  num_heads: int = 64
+  num_layers: int = 24
+  relative_attention_num_buckets: int = 32
+  relative_attention_max_distance: int = 128
+  vocab_size: int = 32128
 
 class T5Tokenizer:
   def __init__(self, spiece_path):
@@ -351,11 +340,8 @@ class T5Stack:
 
 class T5EncoderModel:
   def __init__(self, config: T5Config):
-    self.config = config
     self.shared = nn.Embedding(config.vocab_size, config.d_model)
-
-    encoder_config = copy.deepcopy(config)
-    self.encoder = T5Stack(encoder_config, self.shared)
+    self.encoder = T5Stack(config, self.shared)
 
   def __call__(self, input_ids):
     return self.encoder(input_ids)
@@ -364,20 +350,7 @@ class T5Embedder:
   def __init__(self, max_length, spiece_path):
     self.tokenizer = T5Tokenizer(spiece_path)
     self.max_length = max_length
-
-    config = T5Config(
-        **{
-            "d_ff": 10240,
-            "d_kv": 64,
-            "d_model": 4096,
-            "layer_norm_epsilon": 1e-06,
-            "num_decoder_layers": 24,
-            "num_heads": 64,
-            "num_layers": 24,
-            "relative_attention_num_buckets": 32,
-            "vocab_size": 32128,
-        }
-    )
+    config = T5Config()
     self.encoder = T5EncoderModel(config)
 
   def __call__(self, texts: Union[str, List[str]]):
