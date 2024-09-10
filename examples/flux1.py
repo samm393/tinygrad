@@ -10,18 +10,46 @@ from extra.models.t5 import T5Embedder
 import numpy as np
 
 import math, time, argparse, tempfile
-from typing import Callable
+from typing import Callable, Union, List, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image
 
+configs:dict = {
+  "flux": {
+    "in_channels": 64,
+    "vec_in_dim": 768,
+    "context_in_dim": 4096,
+    "hidden_size": 3072,
+    "mlp_ratio": 4.0,
+    "num_heads": 24,
+    "depth": 19,
+    "depth_single_blocks": 38,
+    "axes_dim": [16, 56, 56],
+    "theta": 10_000,
+    "qkv_bias": True
+  },
 
-def tensor_identity(x: Tensor) -> Tensor:
+  "ae": {
+    "scale_factor": 0.3611,
+    "shift_factor": 0.1159,
+    "resolution": 256,
+    "in_channels": 3,
+    "ch": 128,
+    "out_ch": 3,
+    "ch_mult": [1, 2, 4, 4],
+    "num_res_blocks": 2,
+    "z_channels": 16
+  }
+}
+
+
+def tensor_identity(x:Tensor) -> Tensor:
   return x
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py
 
-def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
+def attention(q:Tensor, k:Tensor, v:Tensor, pe:Tensor) -> Tensor:
   q, k = apply_rope(q, k, pe)
 
   x = Tensor.scaled_dot_product_attention(q, k, v)
@@ -29,7 +57,7 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
   return x
 
-def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
+def rope(pos:Tensor, dim:int, theta:int) -> Tensor:
   assert dim % 2 == 0
   scale = Tensor.arange(0, dim, 2, dtype=dtypes.float32, device=pos.device) / dim
   omega = 1.0 / (theta**scale)
@@ -39,7 +67,7 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
   out = out.rearrange("b n d (i j) -> b n d i j", i=2, j=2)
   return out.float()
 
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+def apply_rope(xq:Tensor, xk:Tensor, freqs_cis:Tensor) -> tuple[Tensor, Tensor]:
   xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
   xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
   xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
@@ -48,24 +76,14 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tenso
 
 # Conditioner
 class ClipEmbedder(FrozenClosedClipEmbedder):
-  def __call__(self, texts):
+  def __call__(self, texts:Union[str,List[str],Tensor]) -> Union[Tensor,Tuple[Tensor,...]]:
+    if isinstance(texts, str): texts = [texts]
+    assert isinstance(texts, (list,tuple)), f"expected list of strings, got {type(texts).__name__}"
     tokens = Tensor.cat(*[Tensor(self.tokenizer.encode(text)) for text in texts], dim=0)
     return self.transformer.text_model(tokens.reshape(len(texts),-1))[:, tokens.argmax(-1)]
 
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/autoencoder.py
-@dataclass
-class AutoEncoderParams:
-  resolution: int = 256
-  in_channels: int = 3
-  ch: int = 128
-  out_ch: int = 3
-  ch_mult: tuple[int] = (1, 2, 4, 4)
-  num_res_blocks: int = 2
-  z_channels: int = 16
-  scale_factor: float = 0.3611
-  shift_factor: float = 0.1159
-
 class AttnBlock:
   def __init__(self, in_channels: int):
     self.in_channels = in_channels
@@ -129,16 +147,7 @@ class Upsample:
     return x
 
 class Decoder:
-  def __init__(
-      self,
-      ch: int,
-      out_ch: int,
-      ch_mult: list[int],
-      num_res_blocks: int,
-      in_channels: int,
-      resolution: int,
-      z_channels: int,
-  ):
+  def __init__(self, ch:int, out_ch:int, ch_mult:list[int], num_res_blocks:int, in_channels:int, resolution:int, z_channels:int):
     self.ch = ch
     self.num_resolutions = len(ch_mult)
     self.num_res_blocks = num_res_blocks
@@ -205,19 +214,11 @@ class Decoder:
     return h
 
 class AutoEncoder:
-  def __init__(self, params: AutoEncoderParams):
-    self.decoder = Decoder(
-        resolution=params.resolution,
-        in_channels=params.in_channels,
-        ch=params.ch,
-        out_ch=params.out_ch,
-        ch_mult=params.ch_mult,
-        num_res_blocks=params.num_res_blocks,
-        z_channels=params.z_channels,
-    )
+  def __init__(self, scale_factor:float, shift_factor:float, **decoder_params):
+    self.decoder = Decoder(**decoder_params)
 
-    self.scale_factor = params.scale_factor
-    self.shift_factor = params.shift_factor
+    self.scale_factor = scale_factor
+    self.shift_factor = shift_factor
 
   def decode(self, z: Tensor) -> Tensor:
     z = z / self.scale_factor + self.shift_factor
@@ -449,57 +450,56 @@ class LastLayer:
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/model.py
 class Model:
-  @dataclass
-  class FluxParams:
-    guidance_embed: bool
-    in_channels: int = 64
-    vec_in_dim: int = 768
-    context_in_dim: int = 4096
-    hidden_size: int = 3072
-    mlp_ratio: float = 4.0
-    num_heads: int = 24
-    depth: int = 19
-    depth_single_blocks: int = 38
-    axes_dim: tuple[int] = (16, 56, 56)
-    theta: int = 10_000
-    qkv_bias: bool = True
-
   class Flux:
     """
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, params):
-      self.params = params
-      self.in_channels = params.in_channels
+    def __init__(
+        self,
+        guidance_embed: bool,
+        in_channels: int = 64,
+        vec_in_dim: int = 768,
+        context_in_dim: int = 4096,
+        hidden_size: int = 3072,
+        mlp_ratio: float = 4.0,
+        num_heads: int = 24,
+        depth: int = 19,
+        depth_single_blocks: int = 38,
+        axes_dim: List[int] = (16, 56, 56),
+        theta: int = 10_000,
+        qkv_bias: bool = True,
+        ):
+      self.guidance_embed = guidance_embed
+      self.in_channels = in_channels
       self.out_channels = self.in_channels
-      if params.hidden_size % params.num_heads != 0:
-        raise ValueError(f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}")
-      pe_dim = params.hidden_size // params.num_heads
-      if sum(params.axes_dim) != pe_dim:
-        raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
-      self.hidden_size = params.hidden_size
-      self.num_heads = params.num_heads
-      self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
+      if hidden_size % num_heads != 0:
+        raise ValueError(f"Hidden size {hidden_size} must be divisible by num_heads {num_heads}")
+      pe_dim = hidden_size // num_heads
+      if sum(axes_dim) != pe_dim:
+        raise ValueError(f"Got {axes_dim} but expected positional dim {pe_dim}")
+      self.hidden_size = hidden_size
+      self.num_heads = num_heads
+      self.pe_embedder = EmbedND(dim=pe_dim, theta=theta, axes_dim=axes_dim)
       self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
       self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
-      self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
-      self.guidance_in = (MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else tensor_identity)
-      self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
+      self.vector_in = MLPEmbedder(vec_in_dim, self.hidden_size)
+      self.guidance_in = (MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if guidance_embed else tensor_identity)
+      self.txt_in = nn.Linear(context_in_dim, self.hidden_size)
 
       self.double_blocks = [
           DoubleStreamBlock(
               self.hidden_size,
               self.num_heads,
-              mlp_ratio=params.mlp_ratio,
-              qkv_bias=params.qkv_bias,
+              mlp_ratio=mlp_ratio,
+              qkv_bias=qkv_bias,
           )
-          for _ in range(params.depth)
+          for _ in range(depth)
       ]
 
       self.single_blocks = [
-          SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
-          for _ in range(params.depth_single_blocks)
+          SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=mlp_ratio)
+          for _ in range(depth_single_blocks)
       ]
 
       self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
@@ -510,7 +510,7 @@ class Model:
       # running on sequences img
       img = self.img_in(img)
       vec = self.time_in(timestep_embedding(timesteps, 256))
-      if self.params.guidance_embed:
+      if self.guidance_embed:
         if guidance is None:
           raise ValueError("Didn't get guidance strength for guidance distilled model.")
         vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
@@ -531,15 +531,10 @@ class Model:
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/util.py
 class Util:
-  configs = {
-    "flux-dev": Model.FluxParams(guidance_embed=True),
-    "flux-schnell": Model.FluxParams(guidance_embed=False),
-    "ae": AutoEncoderParams()}
-
   def load_flow_model(name: str):
     # Loading Flux
     print("Init model")
-    model = Model.Flux(Util.configs[name])
+    model = Model.Flux(guidance_embed=(name != "flux-schnell"), **configs["flux"])
     url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors" if name == "flux-schnell"
            else "https://huggingface.co/camenduru/FLUX.1-dev/resolve/main/flux1-dev.sft")
 
@@ -564,24 +559,17 @@ class Util:
   def load_ae(name: str) -> AutoEncoder:
     # Loading the autoencoder
     print("Init AE")
-    ae = AutoEncoder(Util.configs["ae"])
+    ae = AutoEncoder(**configs["ae"])
     url = ("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors")
     load_state_dict(ae, safe_load(fetch(url)))
     return ae
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/sampling.py
-def get_noise(
-    num_samples: int,
-    height: int,
-    width: int,
-    dtype: str,
-    seed: int,
-):
+def get_noise(num_samples:int, height:int, width:int, dtype:str, seed:int):
   Tensor.manual_seed(seed)
-
   return Tensor.randn(num_samples, 16, 2 * math.ceil(height / 16), 2 * math.ceil(width / 16), dtype=dtype)
 
-def prepare(T5, clip, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]:
+def prepare(T5:T5Embedder, clip:ClipEmbedder, img:Tensor, prompt:str | list[str]) -> dict[str, Tensor]:
   bs, _, h, w = img.shape
   if bs == 1 and not isinstance(prompt, str):
     bs = len(prompt)
@@ -615,12 +603,10 @@ def prepare(T5, clip, img: Tensor, prompt: str | list[str]) -> dict[str, Tensor]
       "vec": vec.to(img.device),
   }
 
-def time_shift(mu: float, sigma: float, t: Tensor):
+def time_shift(mu:float, sigma:float, t:Tensor):
   return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
-def get_lin_function(
-    x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15
-) -> Callable[[float], float]:
+def get_lin_function(x1:float = 256, y1:float = 0.5, x2:float = 4096, y2:float = 1.15) -> Callable[[float], float]:
   m = (y2 - y1) / (x2 - x1)
   b = y1 - m * x1
   return lambda x: m * x + b
@@ -641,10 +627,10 @@ def get_schedule(num_steps:int, image_seq_len:int, base_shift:float = 0.5, max_s
 @TinyJit
 def run(model, *args): return model(*args).realize()
 
-def denoise(model:Model.Flux, img:Tensor, img_ids:Tensor, txt:Tensor, txt_ids:Tensor, vec:Tensor, timesteps:list[float], guidance:float = 4.0) -> Tensor:
+def denoise(model, img:Tensor, img_ids:Tensor, txt:Tensor, txt_ids:Tensor, vec:Tensor, timesteps:list[float], guidance:float = 4.0) -> Tensor:
   # this is ignored for schnell
   guidance_vec = Tensor((guidance,), device=img.device, dtype=img.dtype).expand((img.shape[0],))
-  for t_curr, t_prev in tqdm(list(zip(timesteps[:-1], timesteps[1:])), f"Denoising"):
+  for t_curr, t_prev in tqdm(list(zip(timesteps[:-1], timesteps[1:])), "Denoising"):
     t_vec = Tensor((t_curr,), device=img.device, dtype=img.dtype).expand((img.shape[0],))
     pred = run(model, img, img_ids, txt, txt_ids, t_vec, vec, guidance_vec)
     img = img + (t_prev - t_curr) * pred
@@ -660,18 +646,7 @@ def unpack(x: Tensor, height: int, width: int) -> Tensor:
       pw=2,
   )
 
-
-
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/cli.py
-@dataclass
-class SamplingOptions:
-  prompt: str
-  width: int
-  height: int
-  num_steps: int
-  guidance: float
-  seed: int | None
-
 if __name__ == "__main__":
   default_prompt = "bananas and a can of coke"
   parser = argparse.ArgumentParser(description="Run Flux.1", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -688,68 +663,51 @@ if __name__ == "__main__":
   parser.add_argument("--output_dir", type=str,   default="output",       help="output directory")
   args = parser.parse_args()
 
-  if args.name not in Util.configs:
-    available = ", ".join(Util.configs.keys())
-    raise ValueError(f"Got unknown model name: {args.name}, chose from {available}")
+  if args.name not in ["flux-schnell", "flux-dev"]:
+    raise ValueError(f"Got unknown model name: {args.name}, chose from flux-schnell and flux-dev")
 
   if args.num_steps is None:
-    num_steps = 4 if args.name == "flux-schnell" else 50
+    args.num_steps = 4 if args.name == "flux-schnell" else 50
 
   # allow for packing and conversion to latent space
   height = 16 * (args.height // 16)
   width = 16 * (args.width // 16)
 
-  with Tensor.test():
-    opts = SamplingOptions(
-        prompt=args.prompt,
-        width=width,
-        height=height,
-        num_steps=num_steps,
-        guidance=args.guidance,
-        seed=args.seed,
-    )
+  if args.seed is None:
+    args.seed = Tensor._seed
+  print(f"Generating with seed {args.seed}:\n{args.prompt}")
+  t0 = time.perf_counter()
 
-    if opts.seed is None:
-      opts.seed = Tensor._seed
-    print(f"Generating with seed {opts.seed}:\n{opts.prompt}")
-    t0 = time.perf_counter()
+  # prepare input
+  x = get_noise(1, height, width, dtype=dtypes.bfloat16, seed=args.seed)
 
-    # prepare input
-    x = get_noise(
-        1,
-        opts.height,
-        opts.width,
-        dtype=dtypes.bfloat16,
-        seed=opts.seed,
-    )
+  # load text embedders
+  T5 = Util.load_T5(args.name, max_length=256 if args.name == "flux-schnell" else 512)
+  clip = Util.load_clip(args.name)
 
-    # load text embedders
-    T5 = Util.load_T5(args.name, max_length=256 if args.name == "flux-schnell" else 512)
-    clip = Util.load_clip(args.name)
+  # embed text to get inputs for model
+  inp = prepare(T5, clip, x, prompt=args.prompt)
+  for v in inp.values():  v.realize()
+  timesteps = get_schedule(args.num_steps, inp["img"].shape[1], shift=(args.name != "flux-schnell"))
 
-    # embed text to get inputs for model
-    inp = prepare(T5, clip, x, prompt=opts.prompt)
-    for k, v in inp.items():  v.realize()
-    timesteps = get_schedule(opts.num_steps, inp["img"].shape[1], shift=(args.name != "flux-schnell"))
+  # done with text embedders
+  del T5, clip
 
-    # done with text embedders
-    del T5, clip
+  # load model
+  model = Util.load_flow_model(args.name)
 
-    # load model
-    model = Util.load_flow_model(args.name)
+  # denoise initial noise
+  x = denoise(model, **inp, timesteps=timesteps, guidance=args.guidance)
 
-    # denoise initial noise
-    x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+  # done with model
+  del model, run
 
-    # done with model
-    del model, run
+  # load autoencoder
+  ae = Util.load_ae(args.name)
 
-    # load autoencoder
-    ae = Util.load_ae(args.name)
-
-    # decode latents to pixel space
-    x = unpack(x.float(), opts.height, opts.width).realize()
-    x = ae.decode(x).realize()
+  # decode latents to pixel space
+  x = unpack(x.float(), height, width).realize()
+  x = ae.decode(x).realize()
 
   t1 = time.perf_counter()
 
