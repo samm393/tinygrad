@@ -2,26 +2,21 @@
 # Github Name                    | License | Link
 # black-forest-labs/flux         | Apache  | https://github.com/black-forest-labs/flux/tree/main/model_licenses
 
-import os
-import re
-import time
-from dataclasses import dataclass
-from glob import iglob
-from PIL import Image
-import argparse
-import numpy as np
-
-import math
-from typing import Callable
-
 from tinygrad import Tensor, nn, dtypes, TinyJit
 from tinygrad.nn.state import safe_load, load_state_dict
 from tinygrad.helpers import fetch, tqdm, colored
-
 from extra.models.clip import FrozenClosedClipEmbedder
 from extra.models.t5 import T5Embedder
+import numpy as np
 
-def TensorIdentity(x: Tensor) -> Tensor:
+import math, time, argparse, tempfile
+from typing import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from PIL import Image
+
+
+def tensor_identity(x: Tensor) -> Tensor:
   return x
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py
@@ -489,7 +484,7 @@ class Model:
       self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
       self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
       self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
-      self.guidance_in = (MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else TensorIdentity)
+      self.guidance_in = (MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else tensor_identity)
       self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
       self.double_blocks = [
@@ -509,16 +504,7 @@ class Model:
 
       self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
 
-    def __call__(
-        self,
-        img: Tensor,
-        img_ids: Tensor,
-        txt: Tensor,
-        txt_ids: Tensor,
-        timesteps: Tensor,
-        y: Tensor,
-        guidance: Tensor | None = None,
-    ) -> Tensor:
+    def __call__(self, img:Tensor, img_ids:Tensor, txt:Tensor, txt_ids:Tensor, timesteps:Tensor, y:Tensor, guidance:Tensor | None = None) -> Tensor:
       if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
       # running on sequences img
@@ -639,13 +625,7 @@ def get_lin_function(
   b = y1 - m * x1
   return lambda x: m * x + b
 
-def get_schedule(
-    num_steps: int,
-    image_seq_len: int,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-    shift: bool = True,
-) -> list[float]:
+def get_schedule(num_steps:int, image_seq_len:int, base_shift:float = 0.5, max_shift:float = 1.15, shift:bool = True) -> list[float]:
   # extra step for zero
   step_size = -1.0 / num_steps
   timesteps = Tensor.arange(1, 0 + step_size, step_size)
@@ -661,18 +641,7 @@ def get_schedule(
 @TinyJit
 def run(model, *args): return model(*args).realize()
 
-def denoise(
-    model: Model.Flux,
-    # model input
-    img: Tensor,
-    img_ids: Tensor,
-    txt: Tensor,
-    txt_ids: Tensor,
-    vec: Tensor,
-    # sampling parameters
-    timesteps: list[float],
-    guidance: float = 4.0,
-):
+def denoise(model:Model.Flux, img:Tensor, img_ids:Tensor, txt:Tensor, txt_ids:Tensor, vec:Tensor, timesteps:list[float], guidance:float = 4.0) -> Tensor:
   # this is ignored for schnell
   guidance_vec = Tensor((guidance,), device=img.device, dtype=img.dtype).expand((img.shape[0],))
   for t_curr, t_prev in tqdm(list(zip(timesteps[:-1], timesteps[1:])), f"Denoising"):
@@ -704,7 +673,7 @@ class SamplingOptions:
   seed: int | None
 
 if __name__ == "__main__":
-  default_prompt = "bananas by a coke can"
+  default_prompt = "bananas and a can of coke"
   parser = argparse.ArgumentParser(description="Run Flux.1", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
   parser.add_argument("--name",       type=str,   default="flux-schnell", help="Name of the model to load")
@@ -712,6 +681,7 @@ if __name__ == "__main__":
   parser.add_argument("--height",     type=int,   default=512,            help="height of the sample in pixels (should be a multiple of 16)")
   parser.add_argument("--seed",       type=int,   default=None,           help="Set a seed for sampling")
   parser.add_argument("--prompt",     type=str,   default=default_prompt, help="Prompt used for sampling")
+  parser.add_argument('--out',        type=str,   default=Path(tempfile.gettempdir()) / "rendered.png", help="Output filename")
   parser.add_argument("--num_steps",  type=int,   default=None,           help="number of sampling steps (default 4 for schnell, 50 for guidance distilled)") #noqa:E501
   parser.add_argument("--guidance",   type=float, default=3.5,            help="guidance value used for guidance distillation")
   parser.add_argument("--offload",    type=bool,  default=False,          help="offload to cpu")
@@ -728,14 +698,6 @@ if __name__ == "__main__":
   # allow for packing and conversion to latent space
   height = 16 * (args.height // 16)
   width = 16 * (args.width // 16)
-
-  output_name = os.path.join(args.output_dir, "img_{idx}.png")
-  if not os.path.exists(args.output_dir):
-    os.makedirs(args.output_dir)
-    idx = 0
-  else:
-    fns = [fn for fn in iglob(output_name.format(idx="*")) if re.search(r"img_[0-9]+\.png$", fn)]
-    idx = max(int(fn.split("_")[-1].split(".")[0]) for fn in fns) + 1 if len(fns) > 0 else 0
 
   with Tensor.test():
     opts = SamplingOptions(
@@ -791,8 +753,8 @@ if __name__ == "__main__":
 
   t1 = time.perf_counter()
 
-  fn = output_name.format(idx=idx)
-  print(f"Done in {t1 - t0:.1f}s. Saving {fn}")
+  # fn = output_name.format(idx=idx)
+  print(f"Done in {t1 - t0:.1f}s. Saving {args.out}")
   # bring into PIL format and save
   x = x.clamp(-1, 1)
   x = x[0].rearrange("c h w -> h w c")
@@ -800,10 +762,10 @@ if __name__ == "__main__":
 
   img = Image.fromarray(x.numpy())
 
-  img.save(fn)
+  img.save(args.out)
 
   # validation!
-  if args.prompt == default_prompt and args.name=="flux-dev" and args.seed == 0 and args.width == args.height == 512:
+  if args.prompt == default_prompt and args.name=="flux-schnell" and args.seed == 0 and args.width == args.height == 512:
     ref_image = Tensor(np.array(Image.open("examples/flux1_seed0.png")))
     distance = (((x.cast(dtypes.float) - ref_image.cast(dtypes.float)) / ref_image.max())**2).mean().item()
     assert distance < 4e-3, colored(f"validation failed with {distance=}", "red")

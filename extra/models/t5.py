@@ -188,12 +188,7 @@ class T5Attention:
     values = values.permute([2, 0, 1]).unsqueeze(0)  # shape (1, num_heads, query_length, key_length)
     return values
 
-  def __call__(
-      self,
-      hidden_states,
-      key_value_states=None,
-      position_bias=None,
-  ):
+  def __call__(self, hidden_states, key_value_states=None, position_bias=None):
     """
     Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
     """
@@ -236,9 +231,7 @@ class T5Attention:
       position_bias = self.compute_bias(real_seq_length, key_length, device=scores.device)
 
     scores += position_bias
-    attn_weights = Tensor.softmax(scores.float(), axis=-1).cast(
-        scores.dtype
-    )  # (batch_size, n_heads, seq_length, key_length)
+    attn_weights = Tensor.softmax(scores.float(), axis=-1).cast(scores.dtype)  # (batch_size, n_heads, seq_length, key_length)
 
     attn_output = unshape(Tensor.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
     attn_output = self.o(attn_output)
@@ -253,16 +246,9 @@ class T5LayerSelfAttention:
     self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
     self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
-  def __call__(
-      self,
-      hidden_states,
-      position_bias=None,
-  ):
+  def __call__(self, hidden_states, position_bias=None):
     normed_hidden_states = self.layer_norm(hidden_states)
-    attention_output = self.SelfAttention(
-        normed_hidden_states,
-        position_bias=position_bias,
-    )
+    attention_output = self.SelfAttention(normed_hidden_states, position_bias=position_bias)
     hidden_states = hidden_states + attention_output[0]
     outputs = (hidden_states,) + attention_output[1:]  # add attentions if we output them
     return outputs
@@ -274,15 +260,8 @@ class T5Block:
     self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
     self.layer.append(T5LayerFF(config))
 
-  def __call__(
-      self,
-      hidden_states,
-      position_bias=None,
-  ):
-    self_attention_outputs = self.layer[0](
-        hidden_states,
-        position_bias=position_bias,
-    )
+  def __call__(self, hidden_states, position_bias=None):
+    self_attention_outputs = self.layer[0](hidden_states, position_bias=position_bias)
     hidden_states = self_attention_outputs[0]
     attention_outputs = self_attention_outputs[2:]  # Keep self-attention outputs and relative position weights
 
@@ -324,11 +303,8 @@ class T5Stack:
 
     hidden_states = inputs_embeds
 
-    for i, layer_module in enumerate(self.block):
-      layer_outputs = layer_module(
-          hidden_states,
-          position_bias=position_bias,
-      )
+    for layer_module in self.block:
+      layer_outputs = layer_module(hidden_states, position_bias=position_bias)
 
       # layer_outputs is a tuple with:
       # hidden-states, key-value-states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights) #noqa:E501
