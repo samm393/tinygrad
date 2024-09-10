@@ -234,11 +234,7 @@ class EmbedND:
 
   def __call__(self, ids: Tensor) -> Tensor:
     n_axes = ids.shape[-1]
-    emb = Tensor.cat(
-        *[rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-        dim=-3,
-    )
-
+    emb = Tensor.cat(*[rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)], dim=-3)
     return emb.unsqueeze(1)
 
 
@@ -313,12 +309,12 @@ class ModulationOut:
   gate: Tensor
 
 class Modulation:
-  def __init__(self, dim: int, double: bool):
+  def __init__(self, dim:int, double:bool):
     self.is_double = double
     self.multiplier = 6 if double else 3
     self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
 
-  def __call__(self, vec: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
+  def __call__(self, vec:Tensor) -> tuple[ModulationOut, ModulationOut | None]:
     out = self.lin(vec.silu())[:, None, :].chunk(self.multiplier, dim=-1)
 
     return (
@@ -328,7 +324,7 @@ class Modulation:
 
 
 class DoubleStreamBlock:
-  def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
+  def __init__(self, hidden_size:int, num_heads:int, mlp_ratio:float, qkv_bias:bool = False):
     mlp_hidden_dim = int(hidden_size * mlp_ratio)
     self.num_heads = num_heads
     self.hidden_size = hidden_size
@@ -354,7 +350,7 @@ class DoubleStreamBlock:
         nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
     ]
 
-  def __call__(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
+  def __call__(self, img:Tensor, txt:Tensor, vec:Tensor, pe:Tensor) -> tuple[Tensor, Tensor]:
     img_mod1, img_mod2 = self.img_mod(vec)
     txt_mod1, txt_mod2 = self.txt_mod(vec)
     # prepare image for attention
@@ -395,13 +391,7 @@ class SingleStreamBlock:
   https://arxiv.org/abs/2302.05442 and adapted modulation interface.
   """
 
-  def __init__(
-      self,
-      hidden_size: int,
-      num_heads: int,
-      mlp_ratio: float = 4.0,
-      qk_scale: float | None = None,
-  ):
+  def __init__(self,hidden_size:int, num_heads:int, mlp_ratio:float = 4.0, qk_scale:float | None = None):
     self.hidden_dim = hidden_size
     self.num_heads = num_heads
     head_dim = hidden_size // num_heads
@@ -421,7 +411,7 @@ class SingleStreamBlock:
     self.mlp_act = Tensor.gelu
     self.modulation = Modulation(hidden_size, double=False)
 
-  def __call__(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
+  def __call__(self, x:Tensor, vec:Tensor, pe:Tensor) -> Tensor:
     mod, _ = self.modulation(vec)
     x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
     qkv, mlp = Tensor.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
@@ -437,12 +427,12 @@ class SingleStreamBlock:
 
 
 class LastLayer:
-  def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
+  def __init__(self, hidden_size:int, patch_size:int, out_channels:int):
     self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
     self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
     self.adaLN_modulation = [Tensor.silu, nn.Linear(hidden_size, 2 * hidden_size, bias=True)]
 
-  def __call__(self, x: Tensor, vec: Tensor) -> Tensor:
+  def __call__(self, x:Tensor, vec:Tensor) -> Tensor:
     shift, scale = vec.sequential(self.adaLN_modulation).chunk(2, dim=1)
     x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
     x = self.linear(x)
@@ -457,19 +447,20 @@ class Model:
 
     def __init__(
         self,
-        guidance_embed: bool,
-        in_channels: int = 64,
-        vec_in_dim: int = 768,
-        context_in_dim: int = 4096,
-        hidden_size: int = 3072,
-        mlp_ratio: float = 4.0,
-        num_heads: int = 24,
-        depth: int = 19,
-        depth_single_blocks: int = 38,
-        axes_dim: List[int] = (16, 56, 56),
-        theta: int = 10_000,
-        qkv_bias: bool = True,
+        guidance_embed:bool,
+        in_channels:int = 64,
+        vec_in_dim:int = 768,
+        context_in_dim:int = 4096,
+        hidden_size:int = 3072,
+        mlp_ratio:float = 4.0,
+        num_heads:int = 24,
+        depth:int = 19,
+        depth_single_blocks:int = 38,
+        axes_dim:list[int] = (16, 56, 56),
+        theta:int = 10_000,
+        qkv_bias:bool = True,
         ):
+      
       self.guidance_embed = guidance_embed
       self.in_channels = in_channels
       self.out_channels = self.in_channels
@@ -531,7 +522,7 @@ class Model:
 
 # https://github.com/black-forest-labs/flux/blob/main/src/flux/util.py
 class Util:
-  def load_flow_model(name: str):
+  def load_flow_model(name:str):
     # Loading Flux
     print("Init model")
     model = Model.Flux(guidance_embed=(name != "flux-schnell"), **configs["flux"])
@@ -541,7 +532,7 @@ class Util:
     load_state_dict(model, safe_load(fetch(url)))
     return model
 
-  def load_T5(name: str, max_length: int = 512):
+  def load_T5(name:str, max_length:int = 512):
     # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
     print("Init T5")
     T5 = T5Embedder(max_length, fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/tokenizer_2/spiece.model"))
@@ -550,13 +541,13 @@ class Util:
     load_state_dict(T5.encoder, safe_load(pt_1) | safe_load(pt_2), strict=False)
     return T5
 
-  def load_clip(name: str):
+  def load_clip(name:str):
     print("Init Clip")
     clip = ClipEmbedder()
     load_state_dict(clip.transformer, safe_load(fetch("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/text_encoder/model.safetensors")))
     return clip
 
-  def load_ae(name: str) -> AutoEncoder:
+  def load_ae(name:str) -> AutoEncoder:
     # Loading the autoencoder
     print("Init AE")
     ae = AutoEncoder(**configs["ae"])
